@@ -144,6 +144,17 @@ type serverMigrationImportPreviewResponse struct {
 	Warnings       []string `json:"warnings,omitempty"`
 }
 
+type serverMigrationPackageManifest struct {
+	ConfigPath string `json:"config_path"`
+	AuthDir    string `json:"auth_dir"`
+}
+
+type serverMigrationPackageContext struct {
+	PathMap           map[string]map[string]string
+	ExportProjectRoot string
+	ExportAuthDir     string
+}
+
 func (h *Handler) GetServerMigrationStatus(c *gin.Context) {
 	installerState := detectCertificateInstallerState()
 	if h == nil || h.cfg == nil {
@@ -1430,6 +1441,7 @@ func (h *Handler) previewMigrationPackage(data []byte) (*serverMigrationImportPr
 	if err != nil {
 		return nil, err
 	}
+	packageContext := loadServerMigrationPackageContext(zipReader)
 
 	preview := &serverMigrationImportPreviewResponse{
 		Files:          make([]string, 0, len(zipReader.File)),
@@ -1452,7 +1464,7 @@ func (h *Handler) previewMigrationPackage(data []byte) (*serverMigrationImportPr
 		if file.FileInfo().IsDir() || !strings.HasPrefix(file.Name, "files/") {
 			continue
 		}
-		target := restoreTargetPath(file.Name, h.projectRoot(), h.cfg.AuthDir)
+		target := restoreTargetPath(file.Name, h.projectRoot(), h.cfg.AuthDir, packageContext)
 		if target == "" {
 			preview.Warnings = append(preview.Warnings, "unable to determine restore path for "+file.Name)
 			continue
@@ -1481,6 +1493,7 @@ func (h *Handler) restoreMigrationPackage(data []byte) ([]string, []string, erro
 	if err != nil {
 		return nil, nil, err
 	}
+	packageContext := loadServerMigrationPackageContext(zipReader)
 
 	imported := make([]string, 0, len(zipReader.File))
 	skipped := make([]string, 0)
@@ -1490,7 +1503,7 @@ func (h *Handler) restoreMigrationPackage(data []byte) ([]string, []string, erro
 			continue
 		}
 
-		target := restoreTargetPath(file.Name, h.projectRoot(), h.cfg.AuthDir)
+		target := restoreTargetPath(file.Name, h.projectRoot(), h.cfg.AuthDir, packageContext)
 		if target == "" {
 			skipped = append(skipped, file.Name)
 			continue
@@ -1582,7 +1595,11 @@ func (h *Handler) archivePathForSource(source string) (string, string) {
 	return "files/project/" + clean, filepath.ToSlash(filepath.Join(projectRoot, filepath.FromSlash(clean)))
 }
 
-func restoreTargetPath(archivePath string, projectRoot string, authDir string) string {
+func restoreTargetPath(archivePath string, projectRoot string, authDir string, packageContext serverMigrationPackageContext) string {
+	if target := remapRestoreTargetFromPackage(archivePath, projectRoot, authDir, packageContext); target != "" {
+		return target
+	}
+
 	relative := strings.TrimPrefix(filepath.ToSlash(archivePath), "files/")
 	relative = strings.TrimPrefix(relative, "/")
 	if relative == "" {
@@ -1608,6 +1625,132 @@ func restoreTargetPath(archivePath string, projectRoot string, authDir string) s
 		return filepath.Join(string(filepath.Separator), filepath.FromSlash(relative))
 	}
 	return filepath.Join(projectRoot, filepath.FromSlash(relative))
+}
+
+func loadServerMigrationPackageContext(zipReader *zip.Reader) serverMigrationPackageContext {
+	context := serverMigrationPackageContext{
+		PathMap: make(map[string]map[string]string),
+	}
+
+	readEntry := func(name string) []byte {
+		for _, file := range zipReader.File {
+			if file.Name != name {
+				continue
+			}
+			rc, err := file.Open()
+			if err != nil {
+				return nil
+			}
+			defer func() { _ = rc.Close() }()
+			payload, err := io.ReadAll(rc)
+			if err != nil {
+				return nil
+			}
+			return payload
+		}
+		return nil
+	}
+
+	for _, candidate := range []string{
+		serverMigrationProjectSubdir + "/path-map.json",
+		"path-map.json",
+	} {
+		payload := readEntry(candidate)
+		if len(payload) == 0 {
+			continue
+		}
+		_ = json.Unmarshal(payload, &context.PathMap)
+		if len(context.PathMap) > 0 {
+			break
+		}
+	}
+
+	for _, candidate := range []string{
+		serverMigrationProjectSubdir + "/manifest.json",
+		"manifest.json",
+	} {
+		payload := readEntry(candidate)
+		if len(payload) == 0 {
+			continue
+		}
+		var manifest serverMigrationPackageManifest
+		if err := json.Unmarshal(payload, &manifest); err != nil {
+			continue
+		}
+		context.ExportProjectRoot = filepath.Dir(strings.TrimSpace(manifest.ConfigPath))
+		context.ExportAuthDir = strings.TrimSpace(manifest.AuthDir)
+		if context.ExportProjectRoot != "" || context.ExportAuthDir != "" {
+			break
+		}
+	}
+
+	if context.ExportProjectRoot == "" {
+		context.ExportProjectRoot = "/CLIProxyAPI"
+	}
+	return context
+}
+
+func remapRestoreTargetFromPackage(archivePath string, currentProjectRoot string, currentAuthDir string, packageContext serverMigrationPackageContext) string {
+	meta, ok := packageContext.PathMap[archivePath]
+	if !ok {
+		return ""
+	}
+
+	restoreTo := strings.TrimSpace(meta["restore_to"])
+	if restoreTo == "" {
+		return ""
+	}
+
+	return remapMigrationRestorePath(
+		restoreTo,
+		currentProjectRoot,
+		currentAuthDir,
+		packageContext.ExportProjectRoot,
+		packageContext.ExportAuthDir,
+	)
+}
+
+func remapMigrationRestorePath(rawTarget string, currentProjectRoot string, currentAuthDir string, exportProjectRoot string, exportAuthDir string) string {
+	target := filepath.ToSlash(strings.TrimSpace(rawTarget))
+	if target == "" {
+		return ""
+	}
+
+	currentProjectRoot = filepath.Clean(strings.TrimSpace(currentProjectRoot))
+	currentAuthDir = filepath.Clean(strings.TrimSpace(currentAuthDir))
+	exportProjectRoot = filepath.ToSlash(strings.TrimSpace(exportProjectRoot))
+	exportAuthDir = filepath.ToSlash(strings.TrimSpace(exportAuthDir))
+
+	if exportProjectRoot == "" && strings.HasPrefix(target, "/CLIProxyAPI") {
+		exportProjectRoot = "/CLIProxyAPI"
+	}
+
+	if mapped := remapAbsoluteRoot(target, exportProjectRoot, currentProjectRoot); mapped != "" {
+		return mapped
+	}
+	if mapped := remapAbsoluteRoot(target, exportAuthDir, currentAuthDir); mapped != "" {
+		return mapped
+	}
+
+	return filepath.Clean(filepath.FromSlash(target))
+}
+
+func remapAbsoluteRoot(target string, sourceRoot string, destinationRoot string) string {
+	sourceRoot = filepath.ToSlash(strings.TrimSpace(sourceRoot))
+	destinationRoot = strings.TrimSpace(destinationRoot)
+	if sourceRoot == "" || destinationRoot == "" {
+		return ""
+	}
+	if target != sourceRoot && !strings.HasPrefix(target, sourceRoot+"/") {
+		return ""
+	}
+
+	relative := strings.TrimPrefix(target, sourceRoot)
+	relative = strings.TrimPrefix(relative, "/")
+	if relative == "" {
+		return filepath.Clean(destinationRoot)
+	}
+	return filepath.Clean(filepath.Join(destinationRoot, filepath.FromSlash(relative)))
 }
 
 func (h *Handler) projectRoot() string {
