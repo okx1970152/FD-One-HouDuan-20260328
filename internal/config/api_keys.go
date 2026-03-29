@@ -16,6 +16,7 @@ const generatedAPIKeyPrefix = "xxapi-"
 type APIKeyEntry struct {
 	APIKey        string    `yaml:"api-key" json:"api-key"`
 	CustomerName  string    `yaml:"customer-name,omitempty" json:"customer-name,omitempty"`
+	ModelPrefix   string    `yaml:"model-prefix,omitempty" json:"model-prefix,omitempty"`
 	ExpiresAt     time.Time `yaml:"expires-at,omitempty" json:"expires-at,omitempty"`
 	CreatedAt     time.Time `yaml:"created-at,omitempty" json:"created-at,omitempty"`
 	Enabled       bool      `yaml:"enabled" json:"enabled"`
@@ -92,6 +93,7 @@ func NormalizeAPIKeyEntries(entries []APIKeyEntry) APIKeyEntries {
 
 		entry.APIKey = key
 		entry.CustomerName = strings.TrimSpace(entry.CustomerName)
+		entry.ModelPrefix = normalizeModelPrefix(strings.TrimSpace(entry.ModelPrefix))
 		entry.Note = strings.TrimSpace(entry.Note)
 		entry.AllowedModels = NormalizeAllowedModels(entry.AllowedModels)
 		if entry.CreatedAt.IsZero() {
@@ -102,7 +104,7 @@ func NormalizeAPIKeyEntries(entries []APIKeyEntry) APIKeyEntries {
 		if !entry.ExpiresAt.IsZero() {
 			entry.ExpiresAt = entry.ExpiresAt.UTC()
 		}
-		if !entry.Enabled && strings.TrimSpace(entry.APIKey) != "" && entry.CustomerName == "" && entry.Note == "" && entry.ExpiresAt.IsZero() && len(entry.AllowedModels) == 0 {
+		if !entry.Enabled && strings.TrimSpace(entry.APIKey) != "" && entry.CustomerName == "" && entry.ModelPrefix == "" && entry.Note == "" && entry.ExpiresAt.IsZero() && len(entry.AllowedModels) == 0 {
 			entry.Enabled = true
 		}
 		normalized = append(normalized, entry)

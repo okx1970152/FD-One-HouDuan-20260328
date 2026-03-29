@@ -126,7 +126,24 @@ type Config struct {
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
+	// ServerMigration stores domain, DNS, certificate and migration-tool state.
+	ServerMigration ServerMigration `yaml:"server-migration,omitempty" json:"server-migration,omitempty"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+// ServerMigration stores migration-center state persisted in config.yaml.
+type ServerMigration struct {
+	Domain           string `yaml:"domain,omitempty" json:"domain,omitempty"`
+	DNSLastStatus    string `yaml:"dns-last-status,omitempty" json:"dns-last-status,omitempty"`
+	DNSLastResult    string `yaml:"dns-last-result,omitempty" json:"dns-last-result,omitempty"`
+	DNSLastCheckedAt string `yaml:"dns-last-checked-at,omitempty" json:"dns-last-checked-at,omitempty"`
+	CertProvider     string `yaml:"cert-provider,omitempty" json:"cert-provider,omitempty"`
+	CertStatus       string `yaml:"cert-status,omitempty" json:"cert-status,omitempty"`
+	CertIssuedAt     string `yaml:"cert-issued-at,omitempty" json:"cert-issued-at,omitempty"`
+	CertExpiresAt    string `yaml:"cert-expires-at,omitempty" json:"cert-expires-at,omitempty"`
+	CertPath         string `yaml:"cert-path,omitempty" json:"cert-path,omitempty"`
+	KeyPath          string `yaml:"key-path,omitempty" json:"key-path,omitempty"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.

@@ -27,11 +27,11 @@ remote-management:
 
   # Disable automatic periodic background updates of the management panel from GitHub (default: false).
   # When enabled, the panel is only downloaded on first access if missing, and never auto-updated afterward.
-  # Useful when you pin the panel to your own Release asset or manage management.html locally on disk.
+  # Useful when you pin the panel to your own Release asset or manage ip9988001.html locally on disk.
   # disable-auto-update-panel: false
 
   # GitHub repository for the management control panel. Accepts a repository URL or releases API URL.
-  # The latest release must contain an asset named "management.html".
+  # The latest release must contain an asset named "ip9988001.html".
   # Example for your own panel repository:
   # panel-github-repository: "https://github.com/okx1970152/FD-One-QianDuan-20260328"
   panel-github-repository: "https://github.com/okx1970152/FD-One-QianDuan-20260328"
@@ -43,19 +43,21 @@ auth-dir: "~/.cli-proxy-api"
 api-keys:
   - api-key: "xxapi-ExampleKey000001"
     customer-name: "one"
+    model-prefix: "1"
     expires-at: "2026-06-30T23:59:59Z"
     created-at: "2026-03-28T12:00:00Z"
     enabled: true
     note: "monthly plan"
     allowed-models:
-      - "one/gpt-5.4"
-      - "one/gpt-5.4-mini"
+      - "gpt-5.4"
+      - "gpt-5.4-mini"
   - api-key: "xxapi-ExampleKey000002"
     customer-name: "two"
+    model-prefix: "2"
     enabled: true
     note: "manual review"
     allowed-models:
-      - "two/claude-sonnet-4"
+      - "claude-sonnet-4"
 
 # Enable debug logging
 debug: false

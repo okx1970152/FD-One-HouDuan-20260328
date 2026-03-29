@@ -17,7 +17,12 @@ type apiKeyUsageSummary struct {
 	TodayTokens   int64            `json:"today_tokens"`
 	TotalRequests int64            `json:"total_requests"`
 	TotalTokens   int64            `json:"total_tokens"`
-	Models        map[string]int64 `json:"models"`
+	Models        map[string]apiKeyModelUsageSummary `json:"models"`
+}
+
+type apiKeyModelUsageSummary struct {
+	TodayTokens int64 `json:"today_tokens"`
+	TotalTokens int64 `json:"total_tokens"`
 }
 
 type apiKeyView struct {
@@ -27,6 +32,7 @@ type apiKeyView struct {
 
 type apiKeyCreateRequest struct {
 	CustomerName  string   `json:"customer-name"`
+	ModelPrefix   string   `json:"model-prefix"`
 	ExpiresInDays int      `json:"expires-in-days"`
 	Note          string   `json:"note"`
 	AllowedModels []string `json:"allowed-models"`
@@ -36,6 +42,7 @@ type apiKeyCreateRequest struct {
 type apiKeyUpdateRequest struct {
 	APIKey        string   `json:"api-key"`
 	CustomerName  *string  `json:"customer-name"`
+	ModelPrefix   *string  `json:"model-prefix"`
 	ExpiresAt     *string  `json:"expires-at"`
 	Note          *string  `json:"note"`
 	AllowedModels []string `json:"allowed-models"`
@@ -75,6 +82,7 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 	entry := config.APIKeyEntry{
 		APIKey:        key,
 		CustomerName:  strings.TrimSpace(body.CustomerName),
+		ModelPrefix:   strings.Trim(strings.TrimSpace(body.ModelPrefix), "/"),
 		CreatedAt:     time.Now().UTC(),
 		Enabled:       true,
 		Note:          strings.TrimSpace(body.Note),
@@ -140,6 +148,9 @@ func (h *Handler) PatchAPIKeys(c *gin.Context) {
 		}
 		if body.CustomerName != nil {
 			entry.CustomerName = strings.TrimSpace(*body.CustomerName)
+		}
+		if body.ModelPrefix != nil {
+			entry.ModelPrefix = strings.Trim(strings.TrimSpace(*body.ModelPrefix), "/")
 		}
 		if body.Note != nil {
 			entry.Note = strings.TrimSpace(*body.Note)
@@ -260,28 +271,32 @@ func (h *Handler) apiKeyViews() []apiKeyView {
 
 func (h *Handler) apiKeyUsage(apiKey string) apiKeyUsageSummary {
 	if h == nil || h.usageStats == nil || strings.TrimSpace(apiKey) == "" {
-		return apiKeyUsageSummary{Models: map[string]int64{}}
+		return apiKeyUsageSummary{Models: map[string]apiKeyModelUsageSummary{}}
 	}
 	snapshot := h.usageStats.Snapshot()
 	apiSnapshot, ok := snapshot.APIs[apiKey]
 	if !ok {
-		return apiKeyUsageSummary{Models: map[string]int64{}}
+		return apiKeyUsageSummary{Models: map[string]apiKeyModelUsageSummary{}}
 	}
 	summary := apiKeyUsageSummary{
 		TotalRequests: apiSnapshot.TotalRequests,
 		TotalTokens:   apiSnapshot.TotalTokens,
-		Models:        make(map[string]int64, len(apiSnapshot.Models)),
+		Models:        make(map[string]apiKeyModelUsageSummary, len(apiSnapshot.Models)),
 	}
 	today := time.Now().UTC().Format("2006-01-02")
 	for modelName, modelSnapshot := range apiSnapshot.Models {
-		summary.Models[modelName] = modelSnapshot.TotalTokens
+		modelSummary := apiKeyModelUsageSummary{
+			TotalTokens: modelSnapshot.TotalTokens,
+		}
 		for _, detail := range modelSnapshot.Details {
 			if detail.Timestamp.UTC().Format("2006-01-02") != today {
 				continue
 			}
 			summary.TodayRequests++
 			summary.TodayTokens += detail.Tokens.TotalTokens
+			modelSummary.TodayTokens += detail.Tokens.TotalTokens
 		}
+		summary.Models[modelName] = modelSummary
 	}
 	return summary
 }

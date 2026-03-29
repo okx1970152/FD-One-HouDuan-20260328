@@ -317,7 +317,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 // setupRoutes configures the API routes for the server.
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
-	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/ip9988001.html", s.serveManagementControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -495,6 +495,16 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
 		mgmt.GET("/latest-version", s.mgmt.GetLatestVersion)
+		mgmt.GET("/server-migration", s.mgmt.GetServerMigrationStatus)
+		mgmt.PUT("/server-migration/domain", s.mgmt.PutServerMigrationDomain)
+		mgmt.POST("/server-migration/dns-check", s.mgmt.CheckServerMigrationDNS)
+		mgmt.POST("/server-migration/certificate/install", s.mgmt.InstallServerCertificateIssuer)
+		mgmt.POST("/server-migration/certificate/issue", s.mgmt.IssueServerCertificate)
+		mgmt.POST("/server-migration/certificate/import", s.mgmt.ImportServerCertificate)
+		mgmt.GET("/server-migration/export", s.mgmt.ExportServerMigrationPackage)
+		mgmt.POST("/server-migration/import/preview", s.mgmt.PreviewServerMigrationPackage)
+		mgmt.POST("/server-migration/import", s.mgmt.ImportServerMigrationPackage)
+		mgmt.POST("/server-migration/restart", s.mgmt.RestartManagedService)
 
 		mgmt.GET("/debug", s.mgmt.GetDebug)
 		mgmt.PUT("/debug", s.mgmt.PutDebug)
@@ -672,7 +682,7 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 
 	if _, err := os.Stat(filePath); err != nil {
 		if os.IsNotExist(err) {
-			// Synchronously ensure management.html is available with a detached context.
+			// Synchronously ensure ip9988001.html is available with a detached context.
 			// Control panel bootstrap should not be canceled by client disconnects.
 			if !managementasset.EnsureLatestManagementHTML(context.Background(), managementasset.StaticDir(s.configFilePath), cfg.ProxyURL, cfg.RemoteManagement.PanelGitHubRepository) {
 				c.AbortWithStatus(http.StatusNotFound)

@@ -14,6 +14,7 @@ import (
 
 type apiKeyPolicy struct {
 	CustomerName  string
+	ModelPrefix   string
 	Enabled       bool
 	AllowedModels []string
 	ExpiresAt     time.Time
@@ -33,6 +34,7 @@ func loadAPIKeyPolicy(c *gin.Context) apiKeyPolicy {
 		return policy
 	}
 	policy.CustomerName = strings.TrimSpace(metadata["customer_name"])
+	policy.ModelPrefix = strings.TrimSpace(metadata["model_prefix"])
 	policy.Enabled = !strings.EqualFold(strings.TrimSpace(metadata["enabled"]), "false")
 	if expiresAt := strings.TrimSpace(metadata["expires_at"]); expiresAt != "" {
 		if ts, err := time.Parse(time.RFC3339, expiresAt); err == nil {
@@ -53,14 +55,20 @@ func apiKeyModelPolicyMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		modelName, ok := extractRequestedModel(c)
+		requestedModel, ok := extractRequestedModel(c)
 		if !ok {
 			c.Next()
 			return
 		}
 
+		requestedPrefix, baseModel := splitRequestedModel(requestedModel)
+		if strings.TrimSpace(policy.ModelPrefix) != "" && !strings.EqualFold(requestedPrefix, strings.TrimSpace(policy.ModelPrefix)) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "model prefix not allowed for this api key"})
+			return
+		}
+
 		for _, allowed := range policy.AllowedModels {
-			if strings.EqualFold(strings.TrimSpace(allowed), modelName) {
+			if strings.EqualFold(strings.TrimSpace(allowed), baseModel) {
 				c.Next()
 				return
 			}
@@ -96,6 +104,18 @@ func extractRequestedModel(c *gin.Context) (string, bool) {
 		modelName = strings.TrimSpace(gjson.GetBytes(body, "request.model").String())
 	}
 	return modelName, modelName != ""
+}
+
+func splitRequestedModel(model string) (string, string) {
+	trimmed := strings.TrimSpace(model)
+	if trimmed == "" {
+		return "", ""
+	}
+	parts := strings.SplitN(trimmed, "/", 2)
+	if len(parts) == 2 {
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	}
+	return "", trimmed
 }
 
 func readRequestBody(c *gin.Context) ([]byte, bool) {

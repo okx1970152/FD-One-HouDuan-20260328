@@ -100,6 +100,7 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 				Metadata: map[string]string{
 					"source":         candidate.source,
 					"customer_name":  entry.CustomerName,
+					"model_prefix":   entry.ModelPrefix,
 					"note":           entry.Note,
 					"enabled":        boolString(entry.Enabled),
 					"allowed_models": string(allowedModelsJSON),
