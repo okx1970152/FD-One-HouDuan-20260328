@@ -1312,7 +1312,17 @@ func (h *Handler) buildMigrationPackage() ([]byte, string, error) {
 	}
 
 	_ = addFile(h.configFilePath)
-	_ = addFile(filepath.Join(root, ".env"))
+	envPath := filepath.Join(root, ".env")
+	if fileExists(envPath) {
+		_ = addFile(envPath)
+	} else if envData := buildMigrationEnvData(); len(envData) > 0 {
+		filesAdded = append(filesAdded, "files/project/.env")
+		pathMap["files/project/.env"] = map[string]string{
+			"source_path": "process-environment",
+			"restore_to":  filepath.ToSlash(filepath.Join(root, ".env")),
+		}
+		_ = addBytes("files/project/.env", envData)
+	}
 	_ = addFile(h.cfg.AuthDir)
 	_ = addFile(selectedCertPath)
 	_ = addFile(selectedKeyPath)
@@ -1335,8 +1345,8 @@ func (h *Handler) buildMigrationPackage() ([]byte, string, error) {
 		"domain":      h.cfg.ServerMigration.Domain,
 		"config_path": h.configFilePath,
 		"auth_dir":    h.cfg.AuthDir,
-		"cert_path":   selectedCertPath,
-		"key_path":    selectedKeyPath,
+		"cert_path":   normalizeMigrationExportPath(selectedCertPath),
+		"key_path":    normalizeMigrationExportPath(selectedKeyPath),
 		"files":       filesAdded,
 		"asset_name":  "ip9988001.html",
 	}
@@ -1352,9 +1362,13 @@ func (h *Handler) buildMigrationPackage() ([]byte, string, error) {
 		"status":      h.cfg.ServerMigration.CertStatus,
 		"issued_at":   h.cfg.ServerMigration.CertIssuedAt,
 		"expires_at":  h.cfg.ServerMigration.CertExpiresAt,
-		"cert_path":   selectedCertPath,
-		"key_path":    selectedKeyPath,
-		"required":    []string{"fullchain.pem", "privkey.pem"},
+		"cert_path":   normalizeMigrationExportPath(selectedCertPath),
+		"key_path":    normalizeMigrationExportPath(selectedKeyPath),
+		"required": []map[string][]string{
+			{"pair": []string{"fullchain.pem", "privkey.pem"}},
+			{"pair": []string{".crt", ".key"}},
+			{"pair": []string{"_cert.pem", "_key.pem"}},
+		},
 		"recommended": []string{"cert.pem", "chain.pem"},
 	}
 	certificateManifestData, _ := json.MarshalIndent(certificateManifest, "", "  ")
@@ -1370,7 +1384,11 @@ func (h *Handler) buildMigrationPackage() ([]byte, string, error) {
 		"config_path":                h.configFilePath,
 		"auth_dir":                   h.cfg.AuthDir,
 		"exported_files":             filesAdded,
-		"required_certificate_files": []string{"fullchain.pem", "privkey.pem"},
+		"required_certificate_files": []map[string][]string{
+			{"pair": []string{"fullchain.pem", "privkey.pem"}},
+			{"pair": []string{".crt", ".key"}},
+			{"pair": []string{"_cert.pem", "_key.pem"}},
+		},
 		"exported_at":                time.Now().UTC().Format(time.RFC3339),
 	}
 	summaryData, _ := json.MarshalIndent(summary, "", "  ")
@@ -1420,15 +1438,16 @@ func (h *Handler) previewMigrationPackage(data []byte) (*serverMigrationImportPr
 		Warnings:       []string{},
 	}
 
-	foundRequired := map[string]bool{
-		"fullchain.pem": false,
-		"privkey.pem":   false,
-	}
+	foundCertFile := false
+	foundKeyFile := false
 	for _, file := range zipReader.File {
 		preview.Files = append(preview.Files, file.Name)
 		base := strings.ToLower(filepath.Base(file.Name))
-		if _, ok := foundRequired[base]; ok {
-			foundRequired[base] = true
+		if isMigrationCertificateArchiveEntry(base) {
+			foundCertFile = true
+		}
+		if isMigrationPrivateKeyArchiveEntry(base) {
+			foundKeyFile = true
 		}
 		if file.FileInfo().IsDir() || !strings.HasPrefix(file.Name, "files/") {
 			continue
@@ -1443,10 +1462,11 @@ func (h *Handler) previewMigrationPackage(data []byte) (*serverMigrationImportPr
 		}
 	}
 
-	for required, found := range foundRequired {
-		if !found {
-			preview.MissingFiles = append(preview.MissingFiles, required)
-		}
+	if !foundCertFile {
+		preview.MissingFiles = append(preview.MissingFiles, "certificate file")
+	}
+	if !foundKeyFile {
+		preview.MissingFiles = append(preview.MissingFiles, "private key file")
 	}
 	if len(preview.OverwritePaths) == 0 {
 		preview.Warnings = append(preview.Warnings, "no existing files will be overwritten")
@@ -1536,6 +1556,14 @@ func (h *Handler) archivePathForSource(source string) (string, string) {
 		}
 		return archivePath, filepath.ToSlash(restorePath)
 	}
+	if strings.HasPrefix(cleanSlash, "/host-certs/") {
+		relative := strings.TrimPrefix(cleanSlash, "/host-certs/")
+		return "files/system/home/web/certs/" + relative, "/home/web/certs/" + relative
+	}
+	if strings.HasPrefix(cleanSlash, "/host-letsencrypt/") {
+		relative := strings.TrimPrefix(cleanSlash, "/host-letsencrypt/")
+		return "files/system/etc/letsencrypt/" + relative, "/etc/letsencrypt/" + relative
+	}
 	if strings.HasPrefix(cleanSlash, "/etc/") {
 		relative := strings.TrimPrefix(cleanSlash, "/etc/")
 		return "files/system/etc/" + relative, "/etc/" + relative
@@ -1598,4 +1626,67 @@ func defaultIfEmpty(value string, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func normalizeMigrationExportPath(path string) string {
+	clean := filepath.ToSlash(strings.TrimSpace(path))
+	switch {
+	case strings.HasPrefix(clean, "/host-certs/"):
+		return "/home/web/certs/" + strings.TrimPrefix(clean, "/host-certs/")
+	case strings.HasPrefix(clean, "/host-letsencrypt/"):
+		return "/etc/letsencrypt/" + strings.TrimPrefix(clean, "/host-letsencrypt/")
+	default:
+		return clean
+	}
+}
+
+func buildMigrationEnvData() []byte {
+	keys := []string{
+		"GEMINI_OAUTH_CLIENT_ID",
+		"GEMINI_OAUTH_CLIENT_SECRET",
+		"ANTIGRAVITY_OAUTH_CLIENT_ID",
+		"ANTIGRAVITY_OAUTH_CLIENT_SECRET",
+		"IFLOW_OAUTH_CLIENT_ID",
+		"IFLOW_OAUTH_CLIENT_SECRET",
+		"CLI_PROXY_IMAGE",
+		"DEPLOY",
+		"TZ",
+	}
+	lines := make([]string, 0, len(keys))
+	for _, key := range keys {
+		value, ok := os.LookupEnv(key)
+		if !ok {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	sort.Strings(lines)
+	return []byte(strings.Join(lines, "\n") + "\n")
+}
+
+func isMigrationCertificateArchiveEntry(base string) bool {
+	base = strings.ToLower(strings.TrimSpace(base))
+	switch {
+	case base == "fullchain.pem", base == "cert.pem", base == "fullchain.cer", base == "cert.cer":
+		return true
+	case strings.HasSuffix(base, ".crt"), strings.HasSuffix(base, "_cert.pem"):
+		return true
+	default:
+		return false
+	}
+}
+
+func isMigrationPrivateKeyArchiveEntry(base string) bool {
+	base = strings.ToLower(strings.TrimSpace(base))
+	switch {
+	case base == "privkey.pem":
+		return true
+	case strings.HasSuffix(base, ".key"), strings.HasSuffix(base, "_key.pem"):
+		return true
+	default:
+		return false
+	}
 }
