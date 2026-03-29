@@ -892,23 +892,22 @@ func (h *Handler) scanExistingCertificates() []serverMigrationExistingCertificat
 				return nil
 			}
 
-			certPath, keyPath := findCertificatePairInDir(path)
-			if certPath == "" || keyPath == "" {
-				return nil
-			}
-			pairKey := filepath.Clean(certPath) + "|" + filepath.Clean(keyPath)
-			if _, exists := seenPairs[pairKey]; exists {
-				return nil
-			}
-			seenPairs[pairKey] = struct{}{}
+			for _, pair := range findCertificatePairsInDir(path) {
+				certPath, keyPath := pair[0], pair[1]
+				pairKey := filepath.Clean(certPath) + "|" + filepath.Clean(keyPath)
+				if _, exists := seenPairs[pairKey]; exists {
+					continue
+				}
+				seenPairs[pairKey] = struct{}{}
 
-			item := detectExistingCertificate(certPath, keyPath)
-			item.SourceDir = path
-			item.Selected = samePath(item.CertPath, h.cfg.ServerMigration.CertPath) && samePath(item.KeyPath, h.cfg.ServerMigration.KeyPath)
-			if targetDomain != "" {
-				item.MatchedDomain = certificateMatchesDomain(item, targetDomain)
+				item := detectExistingCertificate(certPath, keyPath)
+				item.SourceDir = path
+				item.Selected = samePath(item.CertPath, h.cfg.ServerMigration.CertPath) && samePath(item.KeyPath, h.cfg.ServerMigration.KeyPath)
+				if targetDomain != "" {
+					item.MatchedDomain = certificateMatchesDomain(item, targetDomain)
+				}
+				certificates = append(certificates, item)
 			}
-			certificates = append(certificates, item)
 			return nil
 		})
 	}
@@ -972,19 +971,47 @@ func detectExistingCertificate(certPath string, keyPath string) serverMigrationE
 	return item
 }
 
-func findCertificatePairInDir(dir string) (string, string) {
-	candidates := [][2]string{
-		{filepath.Join(dir, "fullchain.pem"), filepath.Join(dir, "privkey.pem")},
-		{filepath.Join(dir, "cert.pem"), filepath.Join(dir, "privkey.pem")},
-		{filepath.Join(dir, "fullchain.cer"), filepath.Join(dir, filepath.Base(dir)+".key")},
-		{filepath.Join(dir, "cert.cer"), filepath.Join(dir, filepath.Base(dir)+".key")},
+func findCertificatePairsInDir(dir string) [][2]string {
+	candidates := make([][2]string, 0, 6)
+	seen := map[string]struct{}{}
+	appendPair := func(certPath string, keyPath string) {
+		if !fileExists(certPath) || !fileExists(keyPath) {
+			return
+		}
+		pairKey := filepath.Clean(certPath) + "|" + filepath.Clean(keyPath)
+		if _, exists := seen[pairKey]; exists {
+			return
+		}
+		seen[pairKey] = struct{}{}
+		candidates = append(candidates, [2]string{certPath, keyPath})
 	}
-	for _, pair := range candidates {
-		if fileExists(pair[0]) && fileExists(pair[1]) {
-			return pair[0], pair[1]
+
+	appendPair(filepath.Join(dir, "fullchain.pem"), filepath.Join(dir, "privkey.pem"))
+	appendPair(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "privkey.pem"))
+	appendPair(filepath.Join(dir, "fullchain.cer"), filepath.Join(dir, filepath.Base(dir)+".key"))
+	appendPair(filepath.Join(dir, "cert.cer"), filepath.Join(dir, filepath.Base(dir)+".key"))
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return candidates
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		lowerName := strings.ToLower(name)
+		fullPath := filepath.Join(dir, name)
+		switch {
+		case strings.HasSuffix(lowerName, "_cert.pem"):
+			base := strings.TrimSuffix(name, "_cert.pem")
+			appendPair(fullPath, filepath.Join(dir, base+"_key.pem"))
+		case strings.HasSuffix(lowerName, ".crt"):
+			base := strings.TrimSuffix(name, filepath.Ext(name))
+			appendPair(fullPath, filepath.Join(dir, base+".key"))
 		}
 	}
-	return "", ""
+	return candidates
 }
 
 func certificateMatchesDomain(item serverMigrationExistingCertificate, domain string) bool {
