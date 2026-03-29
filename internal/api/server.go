@@ -499,6 +499,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/server-migration/domain", s.mgmt.PutServerMigrationDomain)
 		mgmt.POST("/server-migration/dns-check", s.mgmt.CheckServerMigrationDNS)
 		mgmt.POST("/server-migration/certificate/install", s.mgmt.InstallServerCertificateIssuer)
+		mgmt.POST("/server-migration/certificate/scan", s.mgmt.ScanServerCertificates)
+		mgmt.POST("/server-migration/certificate/select", s.mgmt.SelectServerCertificate)
 		mgmt.POST("/server-migration/certificate/issue", s.mgmt.IssueServerCertificate)
 		mgmt.POST("/server-migration/certificate/import", s.mgmt.ImportServerCertificate)
 		mgmt.GET("/server-migration/export", s.mgmt.ExportServerMigrationPackage)

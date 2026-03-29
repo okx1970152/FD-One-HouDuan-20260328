@@ -4,9 +4,11 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -56,6 +59,7 @@ type serverMigrationStatusResponse struct {
 	DNSResult        string                   `json:"dns_result,omitempty"`
 	DNSCheckedAt     string                   `json:"dns_checked_at,omitempty"`
 	Certificate      serverMigrationCertState `json:"certificate"`
+	ScannedCertificates []serverMigrationExistingCertificate `json:"scanned_certificates,omitempty"`
 	TLS              serverMigrationTLSState  `json:"tls"`
 	AvailableIssuers []string                 `json:"available_issuers"`
 	Installers       map[string]serverMigrationInstallerState `json:"installers,omitempty"`
@@ -80,12 +84,35 @@ type serverMigrationCertState struct {
 	Importable bool   `json:"importable"`
 }
 
+type serverMigrationExistingCertificate struct {
+	ID            string   `json:"id"`
+	Provider      string   `json:"provider,omitempty"`
+	Status        string   `json:"status"`
+	Domain        string   `json:"domain,omitempty"`
+	Domains       []string `json:"domains,omitempty"`
+	IssuedAt      string   `json:"issued_at,omitempty"`
+	ExpiresAt     string   `json:"expires_at,omitempty"`
+	CertPath      string   `json:"cert_path,omitempty"`
+	KeyPath       string   `json:"key_path,omitempty"`
+	SourceDir     string   `json:"source_dir,omitempty"`
+	Message       string   `json:"message,omitempty"`
+	MatchedDomain bool     `json:"matched_domain"`
+	Selected      bool     `json:"selected"`
+	Importable    bool     `json:"importable"`
+}
+
 type serverMigrationDomainRequest struct {
 	Domain string `json:"domain"`
 }
 
 type serverMigrationIssueRequest struct {
 	Provider string `json:"provider"`
+}
+
+type serverMigrationSelectCertificateRequest struct {
+	ID      string `json:"id"`
+	CertPath string `json:"cert_path"`
+	KeyPath  string `json:"key_path"`
 }
 
 type serverMigrationImportResponse struct {
@@ -134,17 +161,19 @@ func (h *Handler) GetServerMigrationStatus(c *gin.Context) {
 	}
 
 	certState := h.detectCertificateState()
+	scannedCertificates := h.scanExistingCertificates()
 	state := h.cfg.ServerMigration
 	if state.CertStatus == "" {
 		state.CertStatus = certState.Status
 	}
 
 	c.JSON(http.StatusOK, serverMigrationStatusResponse{
-		Domain:       strings.TrimSpace(state.Domain),
-		DNSStatus:    defaultIfEmpty(strings.TrimSpace(state.DNSLastStatus), serverMigrationDNSStatusUnknown),
-		DNSResult:    strings.TrimSpace(state.DNSLastResult),
-		DNSCheckedAt: strings.TrimSpace(state.DNSLastCheckedAt),
-		Certificate:  certState,
+		Domain:              strings.TrimSpace(state.Domain),
+		DNSStatus:           defaultIfEmpty(strings.TrimSpace(state.DNSLastStatus), serverMigrationDNSStatusUnknown),
+		DNSResult:           strings.TrimSpace(state.DNSLastResult),
+		DNSCheckedAt:        strings.TrimSpace(state.DNSLastCheckedAt),
+		Certificate:         certState,
+		ScannedCertificates: scannedCertificates,
 		TLS: serverMigrationTLSState{
 			Enabled:  h.cfg.TLS.Enable,
 			CertPath: strings.TrimSpace(h.cfg.TLS.Cert),
@@ -169,7 +198,7 @@ func (h *Handler) PutServerMigrationDomain(c *gin.Context) {
 		return
 	}
 
-	domain := strings.TrimSpace(body.Domain)
+	domain := sanitizeMigrationDomain(body.Domain)
 	h.cfg.ServerMigration.Domain = domain
 	if domain == "" {
 		h.cfg.ServerMigration.DNSLastStatus = serverMigrationDNSStatusEmpty
@@ -234,6 +263,78 @@ func (h *Handler) InstallServerCertificateIssuer(c *gin.Context) {
 	})
 }
 
+func (h *Handler) ScanServerCertificates(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "config unavailable"})
+		return
+	}
+
+	certificates := h.scanExistingCertificates()
+	c.JSON(http.StatusOK, gin.H{
+		"certificates": certificates,
+		"message":      fmt.Sprintf("scanned %d certificate candidate(s)", len(certificates)),
+	})
+}
+
+func (h *Handler) SelectServerCertificate(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "config unavailable"})
+		return
+	}
+
+	var body serverMigrationSelectCertificateRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+
+	certificates := h.scanExistingCertificates()
+	var selected *serverMigrationExistingCertificate
+	for i := range certificates {
+		item := certificates[i]
+		if strings.TrimSpace(body.ID) != "" && item.ID == strings.TrimSpace(body.ID) {
+			selected = &item
+			break
+		}
+		if strings.TrimSpace(body.CertPath) != "" &&
+			filepath.Clean(item.CertPath) == filepath.Clean(strings.TrimSpace(body.CertPath)) &&
+			filepath.Clean(item.KeyPath) == filepath.Clean(strings.TrimSpace(body.KeyPath)) {
+			selected = &item
+			break
+		}
+	}
+	if selected == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "certificate candidate not found"})
+		return
+	}
+
+	h.cfg.ServerMigration.CertProvider = defaultIfEmpty(strings.TrimSpace(selected.Provider), "existing")
+	h.cfg.ServerMigration.CertStatus = selected.Status
+	h.cfg.ServerMigration.CertIssuedAt = selected.IssuedAt
+	h.cfg.ServerMigration.CertExpiresAt = selected.ExpiresAt
+	h.cfg.ServerMigration.CertPath = selected.CertPath
+	h.cfg.ServerMigration.KeyPath = selected.KeyPath
+	if strings.TrimSpace(selected.Domain) != "" {
+		h.cfg.ServerMigration.Domain = strings.TrimSpace(selected.Domain)
+	}
+	h.cfg.TLS.Enable = selected.Importable
+	if selected.CertPath != "" {
+		h.cfg.TLS.Cert = selected.CertPath
+	}
+	if selected.KeyPath != "" {
+		h.cfg.TLS.Key = selected.KeyPath
+	}
+	if !h.persistSilent() {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save selected certificate"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":     "existing certificate selected",
+		"certificate": h.detectCertificateState(),
+	})
+}
+
 func (h *Handler) IssueServerCertificate(c *gin.Context) {
 	if h == nil || h.cfg == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "config unavailable"})
@@ -246,7 +347,7 @@ func (h *Handler) IssueServerCertificate(c *gin.Context) {
 		return
 	}
 
-	domain := strings.TrimSpace(h.cfg.ServerMigration.Domain)
+	domain := sanitizeMigrationDomain(h.cfg.ServerMigration.Domain)
 	if domain == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing domain"})
 		return
@@ -695,6 +796,21 @@ func (h *Handler) detectCertificateState() serverMigrationCertState {
 		return state
 	}
 
+	for _, item := range h.scanExistingCertificates() {
+		if item.Selected || item.MatchedDomain {
+			return serverMigrationCertState{
+				Provider:   item.Provider,
+				Status:     item.Status,
+				IssuedAt:   item.IssuedAt,
+				ExpiresAt:  item.ExpiresAt,
+				CertPath:   item.CertPath,
+				KeyPath:    item.KeyPath,
+				Message:    item.Message,
+				Importable: item.Importable,
+			}
+		}
+	}
+
 	return serverMigrationCertState{
 		Status:  serverMigrationCertStatusNone,
 		Message: "no imported certificate detected",
@@ -745,6 +861,205 @@ func detectCertificateStateFromFiles(certPath string, keyPath string) serverMigr
 	state.ExpiresAt = cert.NotAfter.UTC().Format(time.RFC3339)
 	state.Message = fmt.Sprintf("certificate issued; expires at %s", cert.NotAfter.UTC().Format("20060102"))
 	return state
+}
+
+func (h *Handler) scanExistingCertificates() []serverMigrationExistingCertificate {
+	if h == nil || h.cfg == nil {
+		return nil
+	}
+
+	targetDomain := sanitizeMigrationDomain(h.cfg.ServerMigration.Domain)
+	searchRoots := []string{
+		filepath.Join(h.projectRoot(), serverMigrationCertificateSubdir),
+		filepath.Join("/etc/letsencrypt/live"),
+		filepath.Join("/etc/letsencrypt/archive"),
+		filepath.Join("/home/web/certs"),
+		filepath.Join("/etc/nginx/certs"),
+		filepath.Join("/host-certs"),
+		filepath.Join("/host-letsencrypt/live"),
+	}
+
+	seenPairs := map[string]struct{}{}
+	certificates := make([]serverMigrationExistingCertificate, 0, 8)
+	for _, root := range searchRoots {
+		info, err := os.Stat(root)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+
+		_ = filepath.Walk(root, func(path string, walkInfo os.FileInfo, walkErr error) error {
+			if walkErr != nil || walkInfo == nil || !walkInfo.IsDir() {
+				return nil
+			}
+
+			certPath, keyPath := findCertificatePairInDir(path)
+			if certPath == "" || keyPath == "" {
+				return nil
+			}
+			pairKey := filepath.Clean(certPath) + "|" + filepath.Clean(keyPath)
+			if _, exists := seenPairs[pairKey]; exists {
+				return nil
+			}
+			seenPairs[pairKey] = struct{}{}
+
+			item := detectExistingCertificate(certPath, keyPath)
+			item.SourceDir = path
+			item.Selected = samePath(item.CertPath, h.cfg.ServerMigration.CertPath) && samePath(item.KeyPath, h.cfg.ServerMigration.KeyPath)
+			if targetDomain != "" {
+				item.MatchedDomain = certificateMatchesDomain(item, targetDomain)
+			}
+			certificates = append(certificates, item)
+			return nil
+		})
+	}
+
+	sort.SliceStable(certificates, func(i, j int) bool {
+		if certificates[i].Selected != certificates[j].Selected {
+			return certificates[i].Selected
+		}
+		if certificates[i].MatchedDomain != certificates[j].MatchedDomain {
+			return certificates[i].MatchedDomain
+		}
+		if certificates[i].ExpiresAt != certificates[j].ExpiresAt {
+			return certificates[i].ExpiresAt > certificates[j].ExpiresAt
+		}
+		return certificates[i].CertPath < certificates[j].CertPath
+	})
+	return certificates
+}
+
+func detectExistingCertificate(certPath string, keyPath string) serverMigrationExistingCertificate {
+	idInput := filepath.Clean(certPath) + "|" + filepath.Clean(keyPath)
+	sum := sha1.Sum([]byte(idInput))
+	item := serverMigrationExistingCertificate{
+		ID:       hex.EncodeToString(sum[:]),
+		Status:   serverMigrationCertStatusNone,
+		CertPath: certPath,
+		KeyPath:  keyPath,
+	}
+
+	state := detectCertificateStateFromFiles(certPath, keyPath)
+	item.Status = state.Status
+	item.IssuedAt = state.IssuedAt
+	item.ExpiresAt = state.ExpiresAt
+	item.Message = state.Message
+	item.Importable = state.Importable
+	item.Provider = inferCertificateProvider(certPath)
+
+	content, err := os.ReadFile(certPath)
+	if err != nil {
+		if item.Message == "" {
+			item.Message = "failed to read certificate file"
+		}
+		return item
+	}
+	block, _ := pem.Decode(content)
+	if block == nil {
+		if item.Message == "" {
+			item.Message = "failed to parse certificate payload"
+		}
+		return item
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		if item.Message == "" {
+			item.Message = "failed to parse certificate metadata"
+		}
+		return item
+	}
+	item.Domain = strings.TrimSpace(cert.Subject.CommonName)
+	item.Domains = uniqueStrings(append([]string{item.Domain}, cert.DNSNames...))
+	return item
+}
+
+func findCertificatePairInDir(dir string) (string, string) {
+	candidates := [][2]string{
+		{filepath.Join(dir, "fullchain.pem"), filepath.Join(dir, "privkey.pem")},
+		{filepath.Join(dir, "cert.pem"), filepath.Join(dir, "privkey.pem")},
+		{filepath.Join(dir, "fullchain.cer"), filepath.Join(dir, filepath.Base(dir)+".key")},
+		{filepath.Join(dir, "cert.cer"), filepath.Join(dir, filepath.Base(dir)+".key")},
+	}
+	for _, pair := range candidates {
+		if fileExists(pair[0]) && fileExists(pair[1]) {
+			return pair[0], pair[1]
+		}
+	}
+	return "", ""
+}
+
+func certificateMatchesDomain(item serverMigrationExistingCertificate, domain string) bool {
+	domain = sanitizeMigrationDomain(domain)
+	for _, candidate := range append([]string{item.Domain}, item.Domains...) {
+		candidate = strings.TrimSpace(strings.ToLower(candidate))
+		if candidate == "" {
+			continue
+		}
+		if candidate == domain {
+			return true
+		}
+		if strings.HasPrefix(candidate, "*.") && strings.HasSuffix(domain, strings.TrimPrefix(candidate, "*")) {
+			return true
+		}
+	}
+	return false
+}
+
+func inferCertificateProvider(certPath string) string {
+	lowerPath := strings.ToLower(filepath.ToSlash(certPath))
+	switch {
+	case strings.Contains(lowerPath, "/etc/letsencrypt/"):
+		return "letsencrypt-existing"
+	case strings.Contains(lowerPath, ".acme.sh"):
+		return "acme.sh-existing"
+	case strings.Contains(lowerPath, "/home/web/certs/"), strings.Contains(lowerPath, "/etc/nginx/certs/"), strings.Contains(lowerPath, "/host-certs/"):
+		return "custom-existing"
+	default:
+		return "existing"
+	}
+}
+
+func sanitizeMigrationDomain(raw string) string {
+	domain := strings.TrimSpace(raw)
+	domain = strings.TrimSuffix(domain, "/")
+	domain = strings.TrimPrefix(domain, "https://")
+	domain = strings.TrimPrefix(domain, "http://")
+	domain = strings.TrimPrefix(domain, "//")
+	if idx := strings.Index(domain, "/"); idx >= 0 {
+		domain = domain[:idx]
+	}
+	return strings.TrimSpace(strings.ToLower(domain))
+}
+
+func samePath(left string, right string) bool {
+	if strings.TrimSpace(left) == "" || strings.TrimSpace(right) == "" {
+		return false
+	}
+	return filepath.Clean(left) == filepath.Clean(right)
+}
+
+func fileExists(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	items := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, exists := seen[trimmed]; exists {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		items = append(items, trimmed)
+	}
+	return items
 }
 
 func detectAvailableCertificateIssuers() []string {
@@ -904,6 +1219,27 @@ func (h *Handler) buildMigrationPackage() ([]byte, string, error) {
 	root := h.projectRoot()
 	filesAdded := make([]string, 0, 12)
 	pathMap := make(map[string]map[string]string)
+	selectedCertPath := strings.TrimSpace(h.cfg.ServerMigration.CertPath)
+	selectedKeyPath := strings.TrimSpace(h.cfg.ServerMigration.KeyPath)
+	if selectedCertPath == "" || selectedKeyPath == "" {
+		for _, item := range h.scanExistingCertificates() {
+			if item.Selected || item.MatchedDomain {
+				selectedCertPath = item.CertPath
+				selectedKeyPath = item.KeyPath
+				if h.cfg.ServerMigration.CertProvider == "" {
+					h.cfg.ServerMigration.CertProvider = item.Provider
+				}
+				if h.cfg.ServerMigration.CertIssuedAt == "" {
+					h.cfg.ServerMigration.CertIssuedAt = item.IssuedAt
+				}
+				if h.cfg.ServerMigration.CertExpiresAt == "" {
+					h.cfg.ServerMigration.CertExpiresAt = item.ExpiresAt
+				}
+				h.cfg.ServerMigration.CertStatus = item.Status
+				break
+			}
+		}
+	}
 
 	addBytes := func(name string, data []byte) error {
 		writer, err := zipWriter.Create(name)
@@ -951,16 +1287,16 @@ func (h *Handler) buildMigrationPackage() ([]byte, string, error) {
 	_ = addFile(h.configFilePath)
 	_ = addFile(filepath.Join(root, ".env"))
 	_ = addFile(h.cfg.AuthDir)
-	_ = addFile(h.cfg.ServerMigration.CertPath)
-	_ = addFile(h.cfg.ServerMigration.KeyPath)
-	if h.cfg.ServerMigration.CertPath != "" {
-		certDir := filepath.Dir(h.cfg.ServerMigration.CertPath)
+	_ = addFile(selectedCertPath)
+	_ = addFile(selectedKeyPath)
+	if selectedCertPath != "" {
+		certDir := filepath.Dir(selectedCertPath)
 		_ = addFile(filepath.Join(certDir, "cert.pem"))
 		_ = addFile(filepath.Join(certDir, "chain.pem"))
 		_ = addFile(filepath.Join(certDir, "fullchain.pem"))
 	}
-	if h.cfg.ServerMigration.KeyPath != "" {
-		keyDir := filepath.Dir(h.cfg.ServerMigration.KeyPath)
+	if selectedKeyPath != "" {
+		keyDir := filepath.Dir(selectedKeyPath)
 		_ = addFile(filepath.Join(keyDir, "privkey.pem"))
 	}
 	_ = addFile("/etc/letsencrypt")
@@ -972,8 +1308,8 @@ func (h *Handler) buildMigrationPackage() ([]byte, string, error) {
 		"domain":      h.cfg.ServerMigration.Domain,
 		"config_path": h.configFilePath,
 		"auth_dir":    h.cfg.AuthDir,
-		"cert_path":   h.cfg.ServerMigration.CertPath,
-		"key_path":    h.cfg.ServerMigration.KeyPath,
+		"cert_path":   selectedCertPath,
+		"key_path":    selectedKeyPath,
 		"files":       filesAdded,
 		"asset_name":  "ip9988001.html",
 	}
@@ -989,8 +1325,8 @@ func (h *Handler) buildMigrationPackage() ([]byte, string, error) {
 		"status":      h.cfg.ServerMigration.CertStatus,
 		"issued_at":   h.cfg.ServerMigration.CertIssuedAt,
 		"expires_at":  h.cfg.ServerMigration.CertExpiresAt,
-		"cert_path":   h.cfg.ServerMigration.CertPath,
-		"key_path":    h.cfg.ServerMigration.KeyPath,
+		"cert_path":   selectedCertPath,
+		"key_path":    selectedKeyPath,
 		"required":    []string{"fullchain.pem", "privkey.pem"},
 		"recommended": []string{"cert.pem", "chain.pem"},
 	}
